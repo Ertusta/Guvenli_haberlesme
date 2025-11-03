@@ -1,0 +1,372 @@
+import socket
+import threading
+import json
+import sqlite3
+import struct
+from utils_des import decrypt_message, encrypt_message
+
+HOST = "0.0.0.0"
+PORT = 5000
+
+clients = {}           # {username: conn}
+clients_lock = threading.Lock()
+
+DB_PATH = "database.db"
+
+def ensure_key_8bytes(key: str) -> str:
+    """DES anahtarı 8 byte olmalı: truncate veya pad ile ayarla"""
+    if len(key) >= 8:
+        return key[:8]
+    return key.ljust(8, '0')
+
+# --- JSON iletişim yardımcıları ---
+def send_json_simple(conn: socket.socket, obj: dict):
+    """Client ile uyumlu basit JSON gönderimi (length-prefix olmadan)"""
+    try:
+        data = json.dumps(obj).encode('utf-8')
+        conn.sendall(data)
+        return True
+    except Exception as e:
+        print(f"[ERROR] JSON gönderimi başarısız: {e}")
+        return False
+
+def recv_json_simple(conn: socket.socket):
+    """Client ile uyumlu basit JSON alımı"""
+    try:
+        data = conn.recv(4096)
+        if not data:
+            return None
+        return json.loads(data.decode('utf-8'))
+    except json.JSONDecodeError as e:
+        print(f"[ERROR] JSON parse hatası: {e}")
+        return None
+    except Exception as e:
+        print(f"[ERROR] JSON alımı başarısız: {e}")
+        return None
+
+# --- Length-prefixed JSON helpers (gelecekte kullanım için) ---
+def send_json_prefixed(conn: socket.socket, obj: dict):
+    """Length-prefixed JSON gönderimi (daha güvenilir)"""
+    try:
+        data = json.dumps(obj).encode('utf-8')
+        length = struct.pack('>I', len(data))
+        conn.sendall(length + data)
+        return True
+    except Exception as e:
+        print(f"[ERROR] Prefixed JSON gönderimi başarısız: {e}")
+        return False
+
+def recv_json_prefixed(conn: socket.socket):
+    """Length-prefixed JSON alımı"""
+    try:
+        # Önce 4 byte uzunluğu oku
+        header = b''
+        while len(header) < 4:
+            chunk = conn.recv(4 - len(header))
+            if not chunk:
+                return None
+            header += chunk
+        msg_len = struct.unpack('>I', header)[0]
+        
+        # Sonra msg_len byte oku
+        data = b''
+        while len(data) < msg_len:
+            chunk = conn.recv(min(4096, msg_len - len(data)))
+            if not chunk:
+                return None
+            data += chunk
+        return json.loads(data.decode('utf-8'))
+    except Exception as e:
+        print(f"[ERROR] Prefixed JSON alımı başarısız: {e}")
+        return None
+
+# Şimdilik client ile uyumluluk için basit versiyonları kullan
+send_json = send_json_simple
+recv_json = recv_json_simple
+
+# --- Veritabanı yardımcıları ---
+def init_db():
+    """Veritabanını başlat"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("""CREATE TABLE IF NOT EXISTS users (
+                        username TEXT PRIMARY KEY,
+                        key TEXT NOT NULL
+                    )""")
+        c.execute("""CREATE TABLE IF NOT EXISTS messages (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        sender TEXT NOT NULL,
+                        receiver TEXT NOT NULL,
+                        message TEXT NOT NULL,
+                        delivered INTEGER DEFAULT 0,
+                        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                    )""")
+        conn.commit()
+        conn.close()
+        print("[DB] Veritabanı başarıyla başlatıldı")
+    except Exception as e:
+        print(f"[DB ERROR] Veritabanı başlatma hatası: {e}")
+
+def register_user(username, key):
+    """Kullanıcı kaydı"""
+    if not username or not key:
+        print("[REGISTER ERROR] Kullanıcı adı veya anahtar boş!")
+        return False
+    
+    key8 = ensure_key_8bytes(key)
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("INSERT OR REPLACE INTO users (username, key) VALUES (?, ?)", (username, key8))
+        conn.commit()
+        conn.close()
+        print(f"[REGISTER] ✅ {username} kayıt oldu.")
+        return True
+    except Exception as e:
+        print(f"[REGISTER ERROR] {username} kayıt hatası: {e}")
+        return False
+
+def get_user_key(username):
+    """Kullanıcı anahtarını getir"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT key FROM users WHERE username=?", (username,))
+        row = c.fetchone()
+        conn.close()
+        return row[0] if row else None
+    except Exception as e:
+        print(f"[DB ERROR] Anahtar getirme hatası {username}: {e}")
+        return None
+
+def user_exists(username):
+    """Kullanıcının kayıtlı olup olmadığını kontrol et"""
+    return get_user_key(username) is not None
+
+def store_message(sender, receiver, enc_msg):
+    """Mesajı veritabanına kaydet"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("INSERT INTO messages (sender, receiver, message, delivered) VALUES (?, ?, ?, 0)",
+                  (sender, receiver, enc_msg))
+        conn.commit()
+        msg_id = c.lastrowid
+        conn.close()
+        print(f"[STORE] 💾 Mesaj kaydedildi (ID: {msg_id}): {sender} -> {receiver}")
+        return msg_id
+    except Exception as e:
+        print(f"[STORE ERROR] Mesaj kaydetme hatası: {e}")
+        return None
+
+def mark_message_delivered(msg_id):
+    """Mesajı teslim edildi olarak işaretle"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("UPDATE messages SET delivered=1 WHERE id=?", (msg_id,))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"[DB ERROR] Mesaj işaretleme hatası: {e}")
+
+def deliver_offline_messages(username, conn):
+    """Çevrimdışı mesajları teslim et"""
+    try:
+        conn_db = sqlite3.connect(DB_PATH)
+        c = conn_db.cursor()
+        c.execute("SELECT id, sender, message FROM messages WHERE receiver=? AND delivered=0 ORDER BY timestamp", 
+                  (username,))
+        rows = c.fetchall()
+
+        if rows:
+            print(f"[OFFLINE] 📨 {username} için {len(rows)} çevrimdışı mesaj bulundu")
+        
+        delivered_count = 0
+        for msg_id, sender, message in rows:
+            try:
+                if send_json(conn, {"type": "message", "from": sender, "data": message}):
+                    mark_message_delivered(msg_id)
+                    delivered_count += 1
+                else:
+                    print(f"[OFFLINE WARN] Mesaj gönderilemedi (ID: {msg_id})")
+            except Exception as e:
+                print(f"[OFFLINE ERROR] Mesaj teslim hatası (ID: {msg_id}): {e}")
+        
+        conn_db.commit()
+        conn_db.close()
+        
+        if delivered_count > 0:
+            print(f"[OFFLINE] ✅ {delivered_count} mesaj teslim edildi: {username}")
+    except Exception as e:
+        print(f"[OFFLINE ERROR] Çevrimdışı mesaj teslimi hatası: {e}")
+
+# --- Mesaj yönlendirme (decrypt + re-encrypt) ---
+def store_or_forward(sender, receiver, encrypted_msg_from_sender):
+    """Mesajı alıcıya yönlendir veya sakla"""
+    
+    # Alıcının kayıtlı olup olmadığını kontrol et
+    if not user_exists(receiver):
+        print(f"[FORWARD ERROR] ❌ Alıcı bulunamadı: {receiver}")
+        return False
+    
+    sender_key = get_user_key(sender)
+    receiver_key = get_user_key(receiver)
+
+    if not sender_key or not receiver_key:
+        print(f"[FORWARD ERROR] ❌ Anahtar eksik: sender={bool(sender_key)}, receiver={bool(receiver_key)}")
+        return False
+
+    try:
+        # Önce sender ile deşifrele
+        plaintext = decrypt_message(sender_key, encrypted_msg_from_sender)
+        print(f"[DECRYPT] 🔓 Mesaj deşifre edildi: {sender} -> {receiver}")
+    except Exception as e:
+        print(f"[DECRYPT ERROR] ❌ Şifre çözme hatası {sender} -> {receiver}: {e}")
+        return False
+
+    try:
+        # Receiver için yeniden şifrele
+        re_enc = encrypt_message(receiver_key, plaintext)
+        print(f"[ENCRYPT] 🔒 Mesaj yeniden şifrelendi: {receiver} anahtarıyla")
+    except Exception as e:
+        print(f"[ENCRYPT ERROR] ❌ Şifreleme hatası: {e}")
+        return False
+
+    # Eğer alıcı online ise doğrudan gönder, değilse veritabanına kaydet
+    with clients_lock:
+        receiver_conn = clients.get(receiver)
+
+    if receiver_conn:
+        try:
+            if send_json(receiver_conn, {"type": "message", "from": sender, "data": re_enc}):
+                print(f"[FORWARD] ✅ Mesaj iletildi: {sender} -> {receiver}")
+                return True
+            else:
+                print(f"[FORWARD WARN] ⚠️ İletim başarısız, mesaj kaydediliyor")
+                store_message(sender, receiver, re_enc)
+                return True
+        except Exception as e:
+            print(f"[FORWARD ERROR] ⚠️ İletim sırasında hata, mesaj kaydediliyor: {e}")
+            store_message(sender, receiver, re_enc)
+            return True
+    else:
+        store_message(sender, receiver, re_enc)
+        print(f"[STORE] 📥 {receiver} çevrimdışı, mesaj kaydedildi")
+        return True
+
+# --- Client bağlantı işleyicisi ---
+def handle_client(conn, addr):
+    """Her client bağlantısını yönet"""
+    print(f"[+] 🔌 Yeni bağlantı: {addr}")
+    username = None
+
+    try:
+        while True:
+            message = recv_json(conn)
+            if message is None:
+                print(f"[-] ⚠️ Bağlantı kesildi: {addr}")
+                break
+
+            mtype = message.get("type")
+            
+            if mtype == "register":
+                username = message.get("username", "").strip()
+                key = message.get("key", "")
+                
+                if not username:
+                    send_json(conn, {"status": "error", "message": "Kullanıcı adı boş olamaz"})
+                    continue
+                
+                if register_user(username, key):
+                    with clients_lock:
+                        # Eğer kullanıcı zaten bağlıysa eski bağlantıyı kapat
+                        if username in clients:
+                            try:
+                                old_conn = clients[username]
+                                send_json(old_conn, {"type": "error", "message": "Başka bir yerden giriş yapıldı"})
+                                old_conn.close()
+                            except:
+                                pass
+                        clients[username] = conn
+                    
+                    send_json(conn, {"status": "registered"})
+                    print(f"[REGISTER] ✅ {username} online oldu (toplam: {len(clients)} kullanıcı)")
+                    
+                    # Kayıt sonrası varsa offline mesajları teslim et
+                    deliver_offline_messages(username, conn)
+                else:
+                    send_json(conn, {"status": "error", "message": "Kayıt başarısız"})
+
+            elif mtype == "message":
+                sender = message.get("sender", "").strip()
+                receiver = message.get("receiver", "").strip()
+                encrypted_msg = message.get("data", "")
+                
+                if not sender or not receiver or not encrypted_msg:
+                    print(f"[MESSAGE ERROR] ❌ Eksik bilgi: sender={bool(sender)}, receiver={bool(receiver)}, data={bool(encrypted_msg)}")
+                    continue
+                
+                print(f"[MESSAGE] 📨 Mesaj alındı: {sender} -> {receiver}")
+                store_or_forward(sender, receiver, encrypted_msg)
+
+            else:
+                print(f"[UNKNOWN] ⚠️ Bilinmeyen mesaj tipi: {mtype}")
+
+    except ConnectionResetError:
+        print(f"[-] ⚠️ Bağlantı zorla kesildi: {addr}")
+    except Exception as e:
+        print(f"[ERROR] ❌ Client işleme hatası ({addr}): {e}")
+
+    finally:
+        # Temizlik
+        if username:
+            with clients_lock:
+                if username in clients and clients[username] == conn:
+                    del clients[username]
+                    print(f"[LOGOUT] 👋 {username} offline oldu (toplam: {len(clients)} kullanıcı)")
+        try:
+            conn.close()
+        except:
+            pass
+        print(f"[-] 🔌 Bağlantı kapandı: {addr}")
+
+# --- Sunucu başlat ---
+def start_server():
+    """Ana sunucu döngüsü"""
+    print("=" * 60)
+    print("🔐 Güvenli Chat Sunucusu Başlatılıyor...")
+    print("=" * 60)
+    
+    init_db()
+    
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind((HOST, PORT))
+            s.listen(5)
+            print(f"[SERVER] ✅ Sunucu başlatıldı: {HOST}:{PORT}")
+            print(f"[SERVER] 👂 Bağlantılar dinleniyor...\n")
+
+            while True:
+                try:
+                    conn, addr = s.accept()
+                    thread = threading.Thread(target=handle_client, args=(conn, addr), daemon=True)
+                    thread.start()
+                except KeyboardInterrupt:
+                    print("\n\n[SERVER] 🛑 Sunucu kapatılıyor...")
+                    break
+                except Exception as e:
+                    print(f"[SERVER ERROR] ❌ Bağlantı kabul hatası: {e}")
+    
+    except Exception as e:
+        print(f"[SERVER ERROR] ❌ Sunucu başlatma hatası: {e}")
+    finally:
+        print("[SERVER] 👋 Sunucu kapatıldı")
+
+if __name__ == "__main__":
+    try:
+        start_server()
+    except KeyboardInterrupt:
+        print("\n[SERVER] 👋 Güle güle!")

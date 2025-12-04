@@ -176,17 +176,22 @@ def deliver_offline_messages(username, conn):
     try:
         conn_db = sqlite3.connect(DB_PATH)
         c = conn_db.cursor()
-        c.execute("SELECT id, sender, message FROM messages WHERE receiver=? AND delivered=0 ORDER BY timestamp", 
+        c.execute("SELECT id, sender, message, strftime('%Y-%m-%d %H:%M:%S', timestamp) as timestamp FROM messages WHERE receiver=? AND delivered=0 ORDER BY timestamp", 
                   (username,))
         rows = c.fetchall()
 
         if rows:
-            print(f"[OFFLINE] 📨 {username} için {len(rows)} çevrimdışı mesaj bulundu")
+            print(f"[OFFLINE] {username} için {len(rows)} çevrimdışı mesaj bulundu")
         
         delivered_count = 0
-        for msg_id, sender, message in rows:
+        for msg_id, sender, message, timestamp in rows:
             try:
-                if send_json(conn, {"type": "message", "from": sender, "data": message}):
+                if send_json(conn, {
+                    "type": "message", 
+                    "from": sender, 
+                    "data": message,
+                    "timestamp": timestamp
+                }):
                     mark_message_delivered(msg_id)
                     delivered_count += 1
                 else:
@@ -198,9 +203,19 @@ def deliver_offline_messages(username, conn):
         conn_db.close()
         
         if delivered_count > 0:
-            print(f"[OFFLINE] ✅ {delivered_count} mesaj teslim edildi: {username}")
+            print(f"[OFFLINE] {delivered_count} mesaj teslim edildi: {username}")
     except Exception as e:
         print(f"[OFFLINE ERROR] Çevrimdışı mesaj teslimi hatası: {e}")
+
+def broadcast_user_list():
+    """Tüm bağlı kullanıcılara güncel kullanıcı listesini gönder"""
+    with clients_lock:
+        user_list = list(clients.keys())
+        for user_conn in clients.values():
+            try:
+                send_json(user_conn, {"type": "user_list", "users": user_list})
+            except:
+                continue
 
 # --- Mesaj yönlendirme (decrypt + re-encrypt) ---
 def store_or_forward(sender, receiver, encrypted_msg_from_sender):
@@ -208,65 +223,67 @@ def store_or_forward(sender, receiver, encrypted_msg_from_sender):
     
     # Alıcının kayıtlı olup olmadığını kontrol et
     if not user_exists(receiver):
-        print(f"[FORWARD ERROR] ❌ Alıcı bulunamadı: {receiver}")
+        print(f"[FORWARD ERROR] Alıcı bulunamadı: {receiver}")
         return False
     
     sender_key = get_user_key(sender)
     receiver_key = get_user_key(receiver)
 
     if not sender_key or not receiver_key:
-        print(f"[FORWARD ERROR] ❌ Anahtar eksik: sender={bool(sender_key)}, receiver={bool(receiver_key)}")
+        print(f"[FORWARD ERROR] Anahtar eksik: sender={bool(sender_key)}, receiver={bool(receiver_key)}")
         return False
 
     try:
         # Önce sender ile deşifrele
         plaintext = decrypt_message(sender_key, encrypted_msg_from_sender)
-        print(f"[DECRYPT] 🔓 Mesaj deşifre edildi: {sender} -> {receiver}")
+        print(f"[DECRYPT] Mesaj deşifre edildi: {sender} -> {receiver}")
     except Exception as e:
-        print(f"[DECRYPT ERROR] ❌ Şifre çözme hatası {sender} -> {receiver}: {e}")
+        print(f"[DECRYPT ERROR] Şifre çözme hatası {sender} -> {receiver}: {e}")
         return False
 
     try:
         # Receiver için yeniden şifrele
         re_enc = encrypt_message(receiver_key, plaintext)
-        print(f"[ENCRYPT] 🔒 Mesaj yeniden şifrelendi: {receiver} anahtarıyla")
+        print(f"[ENCRYPT] Mesaj yeniden şifrelendi: {receiver} anahtarıyla")
     except Exception as e:
-        print(f"[ENCRYPT ERROR] ❌ Şifreleme hatası: {e}")
+        print(f"[ENCRYPT ERROR] Şifreleme hatası: {e}")
         return False
 
-    # Eğer alıcı online ise doğrudan gönder, değilse veritabanına kaydet
+    # Store the message in the database first (both original and re-encrypted)
+    msg_id = store_message(sender, receiver, re_enc)
+    
+    # Eğer alıcı online ise doğrudan gönder
     with clients_lock:
         receiver_conn = clients.get(receiver)
 
     if receiver_conn:
         try:
-            if send_json(receiver_conn, {"type": "message", "from": sender, "data": re_enc}):
-                print(f"[FORWARD] ✅ Mesaj iletildi: {sender} -> {receiver}")
+            if send_json(receiver_conn, {"type": "message", "from": sender, "data": re_enc, "timestamp": ""}):
+                print(f"[FORWARD] Mesaj iletildi: {sender} -> {receiver}")
+                # Mark the message as delivered
+                mark_message_delivered(msg_id)
                 return True
             else:
-                print(f"[FORWARD WARN] ⚠️ İletim başarısız, mesaj kaydediliyor")
-                store_message(sender, receiver, re_enc)
+                print(f"[FORWARD WARN] İletim başarısız, mesaj zaten kaydedildi")
                 return True
         except Exception as e:
-            print(f"[FORWARD ERROR] ⚠️ İletim sırasında hata, mesaj kaydediliyor: {e}")
-            store_message(sender, receiver, re_enc)
+            print(f"[FORWARD ERROR] İletim sırasında hata, mesaj zaten kaydedildi: {e}")
             return True
     else:
-        store_message(sender, receiver, re_enc)
-        print(f"[STORE] 📥 {receiver} çevrimdışı, mesaj kaydedildi")
+        print(f"[STORE] {receiver} çevrimdışı, mesaj kaydedildi (ID: {msg_id})")
         return True
 
 # --- Client bağlantı işleyicisi ---
 def handle_client(conn, addr):
     """Her client bağlantısını yönet"""
-    print(f"[+] 🔌 Yeni bağlantı: {addr}")
+    print(f"[+] Yeni bağlantı: {addr}")
     username = None
 
     try:
         while True:
             message = recv_json(conn)
             if message is None:
-                print(f"[-] ⚠️ Bağlantı kesildi: {addr}")
+                print(f"[-] Bağlantı kesildi: {addr}")
                 break
 
             mtype = message.get("type")
@@ -292,12 +309,64 @@ def handle_client(conn, addr):
                         clients[username] = conn
                     
                     send_json(conn, {"status": "registered"})
-                    print(f"[REGISTER] ✅ {username} online oldu (toplam: {len(clients)} kullanıcı)")
+                    print(f"[REGISTER] {username} online oldu (toplam: {len(clients)} kullanıcı)")
                     
                     # Kayıt sonrası varsa offline mesajları teslim et
                     deliver_offline_messages(username, conn)
-                else:
-                    send_json(conn, {"status": "error", "message": "Kayıt başarısız"})
+                    
+                    # Tüm kullanıcılara güncel kullanıcı listesini gönder
+                    broadcast_user_list()
+                    
+            elif mtype == "get_users":
+                with clients_lock:
+                    user_list = list(clients.keys())
+                send_json(conn, {"type": "user_list", "users": user_list})
+                
+            elif mtype == "get_history":
+                with_user = message.get("with_user")
+                if not username:
+                    print(f"[HISTORY ERROR] Kullanıcı adı belirtilmedi")
+                    send_json(conn, {"type": "error", "message": "Önce giriş yapmalısınız"})
+                    continue
+                    
+                if not with_user:
+                    print(f"[HISTORY ERROR] Geçerli bir alıcı belirtilmedi")
+                    send_json(conn, {"type": "error", "message": "Lütfen bir kullanıcı seçin"})
+                    continue
+                    
+                try:
+                    conn_db = sqlite3.connect(DB_PATH)
+                    c = conn_db.cursor()
+                    
+                    # İki yönlü mesajlaşma geçmişini getir
+                    query = """
+                        SELECT sender, message, strftime('%Y-%m-%d %H:%M:%S', timestamp) as timestamp 
+                        FROM messages 
+                        WHERE (sender = ? AND receiver = ?) OR (sender = ? AND receiver = ?)
+                        ORDER BY timestamp
+                    """
+                    params = (username, with_user, with_user, username)
+                    
+                    print(f"[HISTORY] Sorgu çalıştırılıyor: {query} {params}")
+                    c.execute(query, params)
+                    
+                    messages = []
+                    rows = c.fetchall()
+                    print(f"[HISTORY] {len(rows)} mesaj bulundu")
+                    
+                    for row in rows:
+                        messages.append({
+                            'sender': row[0],
+                            'message': row[1],
+                            'timestamp': row[2]
+                        })
+                    
+                    send_json(conn, {"type": "message_history", "messages": messages})
+                    conn_db.close()
+                    
+                except Exception as e:
+                    print(f"[HISTORY ERROR] Mesaj geçmişi getirilirken hata: {e}")
+                    send_json(conn, {"type": "error", "message": f"Mesaj geçmişi getirilemedi: {str(e)}"})
 
             elif mtype == "message":
                 sender = message.get("sender", "").strip()
@@ -305,32 +374,27 @@ def handle_client(conn, addr):
                 encrypted_msg = message.get("data", "")
                 
                 if not sender or not receiver or not encrypted_msg:
-                    print(f"[MESSAGE ERROR] ❌ Eksik bilgi: sender={bool(sender)}, receiver={bool(receiver)}, data={bool(encrypted_msg)}")
+                    print(f"[MESSAGE ERROR] Eksik bilgi: sender={bool(sender)}, receiver={bool(receiver)}, data={bool(encrypted_msg)}")
                     continue
                 
-                print(f"[MESSAGE] 📨 Mesaj alındı: {sender} -> {receiver}")
+                print(f"[MESSAGE] Mesaj alındı: {sender} -> {receiver}")
                 store_or_forward(sender, receiver, encrypted_msg)
 
             else:
-                print(f"[UNKNOWN] ⚠️ Bilinmeyen mesaj tipi: {mtype}")
+                print(f"[UNKNOWN] Bilinmeyen mesaj tipi: {mtype}")
 
-    except ConnectionResetError:
-        print(f"[-] ⚠️ Bağlantı zorla kesildi: {addr}")
-    except Exception as e:
-        print(f"[ERROR] ❌ Client işleme hatası ({addr}): {e}")
-
+    except (ConnectionResetError, json.JSONDecodeError, OSError) as e:
+        print(f"[-] Bağlantı hatası ({addr}): {e}")
     finally:
-        # Temizlik
         if username:
             with clients_lock:
-                if username in clients and clients[username] == conn:
+                if clients.get(username) == conn:
                     del clients[username]
-                    print(f"[LOGOUT] 👋 {username} offline oldu (toplam: {len(clients)} kullanıcı)")
-        try:
-            conn.close()
-        except:
-            pass
-        print(f"[-] 🔌 Bağlantı kapandı: {addr}")
+                    print(f"[LOGOUT] {username} offline oldu (toplam: {len(clients)} kullanıcı)")
+                    # Kullanıcı ayrıldığında diğer kullanıcıları güncelle
+                    broadcast_user_list()
+        conn.close()
+        print(f"[-] Bağlantı kapandı: {addr}")
 
 # --- Sunucu başlat ---
 def start_server():

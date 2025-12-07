@@ -35,6 +35,10 @@ class SimpleChatUI:
         tk.Label(self.register_frame, text="Username:").pack()
         self.entry_username = tk.Entry(self.register_frame)
         self.entry_username.pack()
+        
+        tk.Label(self.register_frame, text="Password:").pack()
+        self.entry_password = tk.Entry(self.register_frame, show="*")  # Show * for password
+        self.entry_password.pack()
 
         tk.Button(self.register_frame, text="Select Image", command=self.select_image).pack(pady=5)
         tk.Button(self.register_frame, text="Register & Connect", command=self.register_and_connect).pack(pady=10)

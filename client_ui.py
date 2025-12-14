@@ -28,22 +28,57 @@ class SimpleChatUI:
         self.listener_thread = None
         self.stop_event = threading.Event()
 
-        # Register Frame
-        self.register_frame = tk.Frame(master)
-        tk.Label(self.register_frame, text="Register", font=("Arial", 16)).pack(pady=10)
-
+        # Login/Register Frame
+        self.auth_frame = tk.Frame(master)
+        
+        # Title
+        tk.Label(self.auth_frame, text="Secure Chat", font=("Arial", 18, "bold")).pack(pady=10)
+        
+        # Tab buttons
+        button_frame = tk.Frame(self.auth_frame)
+        button_frame.pack(pady=5)
+        
+        self.login_btn = tk.Button(button_frame, text="Login", command=self.show_login, bg="#4CAF50", fg="white", padx=20)
+        self.login_btn.pack(side=tk.LEFT, padx=5)
+        
+        self.register_btn = tk.Button(button_frame, text="Register", command=self.show_register, bg="#2196F3", fg="white", padx=20)
+        self.register_btn.pack(side=tk.LEFT, padx=5)
+        
+        # Login Frame (default)
+        self.login_frame = tk.Frame(self.auth_frame)
+        tk.Label(self.login_frame, text="Login", font=("Arial", 14)).pack(pady=10)
+        
+        tk.Label(self.login_frame, text="Username:").pack()
+        self.entry_login_username = tk.Entry(self.login_frame)
+        self.entry_login_username.pack(pady=5)
+        
+        tk.Label(self.login_frame, text="Password:").pack()
+        self.entry_login_password = tk.Entry(self.login_frame, show="*")
+        self.entry_login_password.pack(pady=5)
+        
+        tk.Button(self.login_frame, text="Login & Connect", command=self.login_and_connect, bg="#4CAF50", fg="white").pack(pady=10)
+        
+        # Register Frame (initially hidden)
+        self.register_frame = tk.Frame(self.auth_frame)
+        tk.Label(self.register_frame, text="Register", font=("Arial", 14)).pack(pady=10)
+        
         tk.Label(self.register_frame, text="Username:").pack()
-        self.entry_username = tk.Entry(self.register_frame)
-        self.entry_username.pack()
+        self.entry_register_username = tk.Entry(self.register_frame)
+        self.entry_register_username.pack(pady=5)
         
         tk.Label(self.register_frame, text="Password:").pack()
-        self.entry_password = tk.Entry(self.register_frame, show="*")  # Show * for password
-        self.entry_password.pack()
+        self.entry_register_password = tk.Entry(self.register_frame, show="*")
+        self.entry_register_password.pack(pady=5)
 
         tk.Button(self.register_frame, text="Select Image", command=self.select_image).pack(pady=5)
-        tk.Button(self.register_frame, text="Register & Connect", command=self.register_and_connect).pack(pady=10)
+        self.register_image_label = tk.Label(self.register_frame, text="")
+        self.register_image_label.pack()
+        
+        tk.Button(self.register_frame, text="Register & Connect", command=self.register_and_connect, bg="#2196F3", fg="white").pack(pady=10)
 
-        self.register_frame.pack(fill="both", expand=True)
+        # Show login frame by default
+        self.login_frame.pack(fill="both", expand=True)
+        self.auth_frame.pack(fill="both", expand=True)
 
         # Main chat container (initially hidden)
         self.main_container = tk.PanedWindow(master, orient=tk.HORIZONTAL)
@@ -63,13 +98,24 @@ class SimpleChatUI:
         self.current_chat_user = None
 
 
+    def show_login(self):
+        """Switch to login frame"""
+        self.register_frame.pack_forget()
+        self.login_frame.pack(fill="both", expand=True)
+        self.login_btn.config(bg="#4CAF50")
+        self.register_btn.config(bg="#2196F3")
+
+    def show_register(self):
+        """Switch to register frame"""
+        self.login_frame.pack_forget()
+        self.register_frame.pack(fill="both", expand=True)
+        self.register_btn.config(bg="#4CAF50")
+        self.login_btn.config(bg="#2196F3")
+
     def select_image(self):
         self.image_path = filedialog.askopenfilename(title="Select Image", filetypes=[("PNG Images", "*.png")])
         if self.image_path:
-            if not hasattr(self, "label_image"):
-                self.label_image = tk.Label(self.register_frame, text="")
-                self.label_image.pack()
-            self.label_image.config(text=os.path.basename(self.image_path))
+            self.register_image_label.config(text=os.path.basename(self.image_path))
 
     def setup_chat_interface(self):
         """Set up the chat interface after successful login"""
@@ -125,22 +171,54 @@ class SimpleChatUI:
         # Show the main container
         self.main_container.pack(fill=tk.BOTH, expand=True)
         
-    def register_and_connect(self):
-        self.username = self.entry_username.get().strip()
+    def login_and_connect(self):
+        self.username = self.entry_login_username.get().strip()
+        self.key = self.entry_login_password.get().strip()
         
         if not self.username:
             messagebox.showerror("Error", "Username is required")
             return
             
-        # Use a default key for now (in a real app, this should be more secure)
-        self.key = "12345678"
         if not self.key:
-            messagebox.showerror("Error", "Encryption key required")
+            messagebox.showerror("Error", "Password is required")
             return
+            
+        # Ensure key is 8 bytes
         if len(self.key) < 8:
             self.key = self.key.ljust(8, '0')
         elif len(self.key) > 8:
             self.key = self.key[:8]
+        
+        self.connect_to_server("login")
+
+    def register_and_connect(self):
+        self.username = self.entry_register_username.get().strip()
+        self.key = self.entry_register_password.get().strip()
+        
+        if not self.username:
+            messagebox.showerror("Error", "Username is required")
+            return
+        
+        if not self.key:
+            messagebox.showerror("Error", "Password is required")
+            return
+            
+        if len(self.key) < 8:
+            self.key = self.key.ljust(8, '0')
+        elif len(self.key) > 8:
+            self.key = self.key[:8]
+        
+        self.connect_to_server("register")
+
+    def connect_to_server(self, action):
+        """Shared connection logic for login/register"""
+        # Close any existing socket to ensure a clean connection
+        if self.sock:
+            try:
+                self.sock.close()
+            except:
+                pass
+            self.sock = None
         
         try:
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -148,31 +226,45 @@ class SimpleChatUI:
             self.sock.settimeout(1.0)  # Set a timeout for socket operations
         except Exception as e:
             messagebox.showerror("Connection Error", f"Cannot connect to server: {e}")
+            self.sock = None
             return
 
-        register_data = json.dumps({
-            "type": "register",
+        payload = json.dumps({
+            "type": action,
             "username": self.username,
             "key": self.key
         }).encode()
 
         try:
-            self.sock.send(register_data)
+            self.sock.send(payload)
             response = self.sock.recv(4096)
             confirm = json.loads(response.decode())
-            if confirm.get("status") == "registered":
-                self.register_frame.pack_forget()
-                self.setup_chat_interface()
-                self.append_text("✅ Connected and registered successfully!\n")
-                self.stop_event.clear()
-                self.listener_thread = threading.Thread(target=self.listen_server, daemon=True)
-                self.listener_thread.start()
-                # Request initial user list
-                self.sock.send(json.dumps({"type": "get_users"}).encode())
-            else:
-                messagebox.showerror("Registration Failed", confirm.get("message", "Unknown error"))
         except Exception as e:
-            messagebox.showerror("Error", f"Registration failed: {e}")
+            messagebox.showerror("Error", f"{action.capitalize()} request failed: {e}")
+            self.sock.close()
+            self.sock = None
+            return
+
+        status = confirm.get("status")
+        success = (action == "register" and status == "registered") or (action == "login" and status == "login_success")
+
+        if success:
+            self.auth_frame.pack_forget()
+            self.setup_chat_interface()
+            success_msg = "✅ Connected and registered successfully!\n" if action == "register" else "✅ Logged in successfully!\n"
+            self.append_text(success_msg)
+            self.stop_event.clear()
+            self.listener_thread = threading.Thread(target=self.listen_server, daemon=True)
+            self.listener_thread.start()
+            # Request initial user list
+            try:
+                self.sock.send(json.dumps({"type": "get_users"}).encode())
+            except Exception as e:
+                self.append_text(f"⚠️ Failed to fetch users: {e}\n")
+        else:
+            message = confirm.get("message", "Unknown error")
+            title = "Registration Failed" if action == "register" else "Login Failed"
+            messagebox.showerror(title, message)
             self.sock.close()
             self.sock = None
 

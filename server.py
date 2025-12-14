@@ -144,6 +144,19 @@ def user_exists(username):
     """Kullanıcının kayıtlı olup olmadığını kontrol et"""
     return get_user_key(username) is not None
 
+def authenticate_user(username, key):
+    """Kullanıcı giriş doğrulaması"""
+    if not username or not key:
+        return False
+    
+    stored_key = get_user_key(username)
+    if not stored_key:
+        return False
+    
+    # Compare the provided key with the stored key
+    key8 = ensure_key_8bytes(key)
+    return key8 == stored_key
+
 def store_message(sender, receiver, enc_msg):
     """Mesajı veritabanına kaydet"""
     try:
@@ -288,7 +301,38 @@ def handle_client(conn, addr):
 
             mtype = message.get("type")
             
-            if mtype == "register":
+            if mtype == "login":
+                username = message.get("username", "").strip()
+                key = message.get("key", "")
+                
+                if not username:
+                    send_json(conn, {"status": "error", "message": "Kullanıcı adı boş olamaz"})
+                    continue
+                
+                if authenticate_user(username, key):
+                    with clients_lock:
+                        # Eğer kullanıcı zaten bağlıysa eski bağlantıyı kapat
+                        if username in clients:
+                            try:
+                                old_conn = clients[username]
+                                send_json(old_conn, {"type": "error", "message": "Başka bir yerden giriş yapıldı"})
+                                old_conn.close()
+                            except:
+                                pass
+                        clients[username] = conn
+                    
+                    send_json(conn, {"status": "login_success"})
+                    print(f"[LOGIN] {username} giriş yaptı (toplam: {len(clients)} kullanıcı)")
+                    
+                    # Giriş sonrası varsa offline mesajları teslim et
+                    deliver_offline_messages(username, conn)
+                    
+                    # Tüm kullanıcılara güncel kullanıcı listesini gönder
+                    broadcast_user_list()
+                else:
+                    send_json(conn, {"status": "error", "message": "Kullanıcı adı veya şifre hatalı"})
+                    
+            elif mtype == "register":
                 username = message.get("username", "").strip()
                 key = message.get("key", "")
                 

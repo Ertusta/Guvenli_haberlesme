@@ -1,19 +1,15 @@
 import tkinter as tk
-from tkinter import filedialog, messagebox, simpledialog
-import subprocess
-import sys
-import os
+from tkinter import filedialog, messagebox
 import socket
 import json
 import threading
-from utils_des import encrypt_message, decrypt_message
+import time
+import base64
+import os
+from utils_des import encrypt_message, decrypt_message, embed_password_in_image
 
 SERVER_IP = "127.0.0.1"
 PORT = 5000
-
-# server.py'yi başlat
-server_path = os.path.join(os.path.dirname(__file__), "server.py")
-subprocess.Popen([sys.executable, server_path])
 
 class SimpleChatUI:
     def __init__(self, master):
@@ -70,8 +66,8 @@ class SimpleChatUI:
         self.entry_register_password = tk.Entry(self.register_frame, show="*")
         self.entry_register_password.pack(pady=5)
 
-        tk.Button(self.register_frame, text="Select Image", command=self.select_image).pack(pady=5)
-        self.register_image_label = tk.Label(self.register_frame, text="")
+        tk.Button(self.register_frame, text="Select Image", command=self.select_image, bg="#FF9800", fg="white").pack(pady=5)
+        self.register_image_label = tk.Label(self.register_frame, text="No image selected", fg="red")
         self.register_image_label.pack()
         
         tk.Button(self.register_frame, text="Register & Connect", command=self.register_and_connect, bg="#2196F3", fg="white").pack(pady=10)
@@ -113,9 +109,15 @@ class SimpleChatUI:
         self.login_btn.config(bg="#2196F3")
 
     def select_image(self):
-        self.image_path = filedialog.askopenfilename(title="Select Image", filetypes=[("PNG Images", "*.png")])
+        """Kullanıcı resim seçer"""
+        self.image_path = filedialog.askopenfilename(
+            title="Select Image", 
+            filetypes=[("Image Files", "*.png *.jpg *.jpeg *.bmp")]
+        )
         if self.image_path:
-            self.register_image_label.config(text=os.path.basename(self.image_path))
+            self.register_image_label.config(text=f"✓ {os.path.basename(self.image_path)}", fg="green")
+        else:
+            self.register_image_label.config(text="No image selected", fg="red")
 
     def setup_chat_interface(self):
         """Set up the chat interface after successful login"""
@@ -192,6 +194,7 @@ class SimpleChatUI:
         self.connect_to_server("login")
 
     def register_and_connect(self):
+        """REGISTER: Parolayı resme göm ve sunucuya gönder"""
         self.username = self.entry_register_username.get().strip()
         self.key = self.entry_register_password.get().strip()
         
@@ -202,47 +205,94 @@ class SimpleChatUI:
         if not self.key:
             messagebox.showerror("Error", "Password is required")
             return
+        
+        if not self.image_path:
+            messagebox.showerror("Error", "Please select an image!")
+            return
             
+        # Ensure key is 8 bytes
         if len(self.key) < 8:
             self.key = self.key.ljust(8, '0')
         elif len(self.key) > 8:
             self.key = self.key[:8]
         
-        self.connect_to_server("register")
+        try:
+            # 🔐 STEGANOGRAPHY: Parolayı resme göm
+            temp_dir = os.path.join(os.path.dirname(__file__), "temp_images")
+            os.makedirs(temp_dir, exist_ok=True)
+            stego_image_path = os.path.join(temp_dir, f"{self.username}_stego.png")
+            
+            embed_password_in_image(self.image_path, self.key, stego_image_path)
+            print(f"[CLIENT] ✅ Parola resme gömüldü: {stego_image_path}")
+            
+            # Resmi base64'e çevir
+            with open(stego_image_path, 'rb') as f:
+                image_data = base64.b64encode(f.read()).decode('utf-8')
+            
+            # Geçici dosyayı sil
+            os.remove(stego_image_path)
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Image processing failed: {e}")
+            return
+        
+        # Sunucuya bağlan ve resmi gönder
+        self.connect_to_server("register", image_data)
 
-    def connect_to_server(self, action):
+    def connect_to_server(self, action, image_data=None):
         """Shared connection logic for login/register"""
         # Close any existing socket to ensure a clean connection
         if self.sock:
+            try:
+                self.sock.shutdown(socket.SHUT_RDWR)
+            except:
+                pass
             try:
                 self.sock.close()
             except:
                 pass
             self.sock = None
         
+        # Kısa bir bekleme süresi ekle
+        time.sleep(0.2)
+        
         try:
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.sock.settimeout(5.0)  # Bağlantı için timeout
             self.sock.connect((SERVER_IP, PORT))
-            self.sock.settimeout(1.0)  # Set a timeout for socket operations
+            self.sock.settimeout(1.0)  # Normal işlemler için timeout
+        except socket.timeout:
+            messagebox.showerror("Connection Error", "Sunucuya bağlanırken zaman aşımı! Server çalışıyor mu?")
+            self.sock = None
+            return
         except Exception as e:
-            messagebox.showerror("Connection Error", f"Cannot connect to server: {e}")
+            messagebox.showerror("Connection Error", f"Sunucuya bağlanılamadı: {e}")
             self.sock = None
             return
 
-        payload = json.dumps({
+        payload = {
             "type": action,
-            "username": self.username,
-            "key": self.key
-        }).encode()
+            "username": self.username
+        }
+        
+        # Register ise resim verisini ekle
+        if action == "register":
+            payload["image_data"] = image_data
+        else:
+            # Login ise sadece key gönder
+            payload["key"] = self.key
 
         try:
-            self.sock.send(payload)
-            response = self.sock.recv(4096)
+            self.sock.send(json.dumps(payload).encode())
+            response = self.sock.recv(8192)  # Büyük resim için 8KB
             confirm = json.loads(response.decode())
+        except socket.timeout:
+            messagebox.showerror("Error", f"{action.capitalize()} işlemi zaman aşımına uğradı")
+            self.cleanup_socket()
+            return
         except Exception as e:
-            messagebox.showerror("Error", f"{action.capitalize()} request failed: {e}")
-            self.sock.close()
-            self.sock = None
+            messagebox.showerror("Error", f"{action.capitalize()} işlemi başarısız: {e}")
+            self.cleanup_socket()
             return
 
         status = confirm.get("status")
@@ -265,7 +315,19 @@ class SimpleChatUI:
             message = confirm.get("message", "Unknown error")
             title = "Registration Failed" if action == "register" else "Login Failed"
             messagebox.showerror(title, message)
-            self.sock.close()
+            self.cleanup_socket()
+
+    def cleanup_socket(self):
+        """Güvenli socket temizleme"""
+        if self.sock:
+            try:
+                self.sock.shutdown(socket.SHUT_RDWR)
+            except:
+                pass
+            try:
+                self.sock.close()
+            except:
+                pass
             self.sock = None
 
     def listen_server(self):
@@ -307,7 +369,7 @@ class SimpleChatUI:
                     
             except socket.timeout:
                 # Request updated user list periodically
-                if self.sock:
+                if self.sock and not self.stop_event.is_set():
                     try:
                         self.sock.send(json.dumps({"type": "get_users"}).encode())
                     except:
@@ -446,9 +508,17 @@ class SimpleChatUI:
         self.text_area.config(state='disabled')
 
     def close(self):
+        """Uygulama kapatılırken çağrılır"""
         self.stop_event.set()
-        if self.sock:
-            self.sock.close()
+        
+        # Listener thread'in bitmesini bekle
+        if self.listener_thread and self.listener_thread.is_alive():
+            self.listener_thread.join(timeout=2.0)
+        
+        # Socket'i temizle
+        self.cleanup_socket()
+        
+        # Pencereyi kapat
         self.master.destroy()
 
 if __name__ == "__main__":

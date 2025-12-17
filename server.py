@@ -2,8 +2,9 @@ import socket
 import threading
 import json
 import sqlite3
-import struct
-from utils_des import decrypt_message, encrypt_message
+import base64
+import os
+from utils_des import decrypt_message, encrypt_message, extract_password_from_image
 
 HOST = "0.0.0.0"
 PORT = 5000
@@ -12,6 +13,10 @@ clients = {}           # {username: conn}
 clients_lock = threading.Lock()
 
 DB_PATH = "database.db"
+IMAGES_DIR = "server_images"
+
+# Resim klasörünü oluştur
+os.makedirs(IMAGES_DIR, exist_ok=True)
 
 def ensure_key_8bytes(key: str) -> str:
     """DES anahtarı 8 byte olmalı: truncate veya pad ile ayarla"""
@@ -20,8 +25,8 @@ def ensure_key_8bytes(key: str) -> str:
     return key.ljust(8, '0')
 
 # --- JSON iletişim yardımcıları ---
-def send_json_simple(conn: socket.socket, obj: dict):
-    """Client ile uyumlu basit JSON gönderimi (length-prefix olmadan)"""
+def send_json(conn: socket.socket, obj: dict):
+    """Client ile uyumlu basit JSON gönderimi"""
     try:
         data = json.dumps(obj).encode('utf-8')
         conn.sendall(data)
@@ -30,59 +35,22 @@ def send_json_simple(conn: socket.socket, obj: dict):
         print(f"[ERROR] JSON gönderimi başarısız: {e}")
         return False
 
-def recv_json_simple(conn: socket.socket):
-    """Client ile uyumlu basit JSON alımı"""
+def recv_json(conn: socket.socket, timeout=5.0):
+    """Client ile uyumlu basit JSON alımı - timeout ile"""
     try:
-        data = conn.recv(4096)
+        conn.settimeout(timeout)
+        data = conn.recv(8192)  # Büyük resim için 8KB
         if not data:
             return None
         return json.loads(data.decode('utf-8'))
+    except socket.timeout:
+        return None
     except json.JSONDecodeError as e:
         print(f"[ERROR] JSON parse hatası: {e}")
         return None
     except Exception as e:
         print(f"[ERROR] JSON alımı başarısız: {e}")
         return None
-
-# --- Length-prefixed JSON helpers (gelecekte kullanım için) ---
-def send_json_prefixed(conn: socket.socket, obj: dict):
-    """Length-prefixed JSON gönderimi (daha güvenilir)"""
-    try:
-        data = json.dumps(obj).encode('utf-8')
-        length = struct.pack('>I', len(data))
-        conn.sendall(length + data)
-        return True
-    except Exception as e:
-        print(f"[ERROR] Prefixed JSON gönderimi başarısız: {e}")
-        return False
-
-def recv_json_prefixed(conn: socket.socket):
-    """Length-prefixed JSON alımı"""
-    try:
-        # Önce 4 byte uzunluğu oku
-        header = b''
-        while len(header) < 4:
-            chunk = conn.recv(4 - len(header))
-            if not chunk:
-                return None
-            header += chunk
-        msg_len = struct.unpack('>I', header)[0]
-        
-        # Sonra msg_len byte oku
-        data = b''
-        while len(data) < msg_len:
-            chunk = conn.recv(min(4096, msg_len - len(data)))
-            if not chunk:
-                return None
-            data += chunk
-        return json.loads(data.decode('utf-8'))
-    except Exception as e:
-        print(f"[ERROR] Prefixed JSON alımı başarısız: {e}")
-        return None
-
-# Şimdilik client ile uyumluluk için basit versiyonları kullan
-send_json = send_json_simple
-recv_json = recv_json_simple
 
 # --- Veritabanı yardımcıları ---
 def init_db():
@@ -92,7 +60,8 @@ def init_db():
         c = conn.cursor()
         c.execute("""CREATE TABLE IF NOT EXISTS users (
                         username TEXT PRIMARY KEY,
-                        key TEXT NOT NULL
+                        key TEXT NOT NULL,
+                        image_path TEXT
                     )""")
         c.execute("""CREATE TABLE IF NOT EXISTS messages (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -108,7 +77,7 @@ def init_db():
     except Exception as e:
         print(f"[DB ERROR] Veritabanı başlatma hatası: {e}")
 
-def register_user(username, key):
+def register_user(username, key, image_path=None):
     """Kullanıcı kaydı"""
     if not username or not key:
         print("[REGISTER ERROR] Kullanıcı adı veya anahtar boş!")
@@ -118,10 +87,11 @@ def register_user(username, key):
     try:
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
-        c.execute("INSERT OR REPLACE INTO users (username, key) VALUES (?, ?)", (username, key8))
+        c.execute("INSERT OR REPLACE INTO users (username, key, image_path) VALUES (?, ?, ?)", 
+                  (username, key8, image_path))
         conn.commit()
         conn.close()
-        print(f"[REGISTER] ✅ {username} kayıt oldu.")
+        print(f"[REGISTER] ✅ {username} kayıt oldu (key: {key8[:4]}...)")
         return True
     except Exception as e:
         print(f"[REGISTER ERROR] {username} kayıt hatası: {e}")
@@ -262,7 +232,7 @@ def store_or_forward(sender, receiver, encrypted_msg_from_sender):
         print(f"[ENCRYPT ERROR] Şifreleme hatası: {e}")
         return False
 
-    # Store the message in the database first (both original and re-encrypted)
+    # Store the message in the database first
     msg_id = store_message(sender, receiver, re_enc)
     
     # Eğer alıcı online ise doğrudan gönder
@@ -272,8 +242,7 @@ def store_or_forward(sender, receiver, encrypted_msg_from_sender):
     if receiver_conn:
         try:
             if send_json(receiver_conn, {"type": "message", "from": sender, "data": re_enc, "timestamp": ""}):
-                print(f"[FORWARD] Mesaj iletildi: {sender} -> {receiver}")
-                # Mark the message as delivered
+                print(f"[FORWARD] ✅ Mesaj iletildi: {sender} -> {receiver}")
                 mark_message_delivered(msg_id)
                 return True
             else:
@@ -283,20 +252,41 @@ def store_or_forward(sender, receiver, encrypted_msg_from_sender):
             print(f"[FORWARD ERROR] İletim sırasında hata, mesaj zaten kaydedildi: {e}")
             return True
     else:
-        print(f"[STORE] {receiver} çevrimdışı, mesaj kaydedildi (ID: {msg_id})")
+        print(f"[STORE] 📦 {receiver} çevrimdışı, mesaj kaydedildi (ID: {msg_id})")
         return True
+
+def cleanup_connection(conn, username):
+    """Bağlantıyı temizle ve kapatmayı garanti et"""
+    try:
+        conn.shutdown(socket.SHUT_RDWR)
+    except:
+        pass
+    
+    try:
+        conn.close()
+    except:
+        pass
+    
+    if username:
+        with clients_lock:
+            if clients.get(username) == conn:
+                del clients[username]
+                print(f"[CLEANUP] {username} bağlantısı temizlendi")
 
 # --- Client bağlantı işleyicisi ---
 def handle_client(conn, addr):
     """Her client bağlantısını yönet"""
     print(f"[+] Yeni bağlantı: {addr}")
     username = None
+    
+    # Socket'e timeout ekle
+    conn.settimeout(30.0)
 
     try:
         while True:
-            message = recv_json(conn)
+            message = recv_json(conn, timeout=30.0)
             if message is None:
-                print(f"[-] Bağlantı kesildi: {addr}")
+                print(f"[-] Bağlantı kesildi veya timeout: {addr}")
                 break
 
             mtype = message.get("type")
@@ -313,53 +303,70 @@ def handle_client(conn, addr):
                     with clients_lock:
                         # Eğer kullanıcı zaten bağlıysa eski bağlantıyı kapat
                         if username in clients:
+                            old_conn = clients[username]
                             try:
-                                old_conn = clients[username]
                                 send_json(old_conn, {"type": "error", "message": "Başka bir yerden giriş yapıldı"})
-                                old_conn.close()
+                                cleanup_connection(old_conn, None)
                             except:
                                 pass
                         clients[username] = conn
                     
                     send_json(conn, {"status": "login_success"})
-                    print(f"[LOGIN] {username} giriş yaptı (toplam: {len(clients)} kullanıcı)")
+                    print(f"[LOGIN] ✅ {username} giriş yaptı (toplam: {len(clients)} kullanıcı)")
                     
-                    # Giriş sonrası varsa offline mesajları teslim et
                     deliver_offline_messages(username, conn)
-                    
-                    # Tüm kullanıcılara güncel kullanıcı listesini gönder
                     broadcast_user_list()
                 else:
                     send_json(conn, {"status": "error", "message": "Kullanıcı adı veya şifre hatalı"})
                     
             elif mtype == "register":
                 username = message.get("username", "").strip()
-                key = message.get("key", "")
+                image_data = message.get("image_data")
                 
                 if not username:
                     send_json(conn, {"status": "error", "message": "Kullanıcı adı boş olamaz"})
                     continue
                 
-                if register_user(username, key):
-                    with clients_lock:
-                        # Eğer kullanıcı zaten bağlıysa eski bağlantıyı kapat
-                        if username in clients:
-                            try:
+                if not image_data:
+                    send_json(conn, {"status": "error", "message": "Resim verisi eksik"})
+                    continue
+                
+                try:
+                    # 🔓 STEGANOGRAPHY: Resimden parolayı çıkart
+                    image_path = os.path.join(IMAGES_DIR, f"{username}.png")
+                    
+                    # Base64'ü decode et ve kaydet
+                    image_bytes = base64.b64decode(image_data)
+                    with open(image_path, 'wb') as f:
+                        f.write(image_bytes)
+                    
+                    # Resimden parolayı çıkart
+                    extracted_key = extract_password_from_image(image_path)
+                    print(f"[STEGO] 🔓 Resimden parola çıkartıldı: {username} -> {extracted_key[:4]}...")
+                    
+                    # Kullanıcıyı kaydet
+                    if register_user(username, extracted_key, image_path):
+                        with clients_lock:
+                            if username in clients:
                                 old_conn = clients[username]
-                                send_json(old_conn, {"type": "error", "message": "Başka bir yerden giriş yapıldı"})
-                                old_conn.close()
-                            except:
-                                pass
-                        clients[username] = conn
-                    
-                    send_json(conn, {"status": "registered"})
-                    print(f"[REGISTER] {username} online oldu (toplam: {len(clients)} kullanıcı)")
-                    
-                    # Kayıt sonrası varsa offline mesajları teslim et
-                    deliver_offline_messages(username, conn)
-                    
-                    # Tüm kullanıcılara güncel kullanıcı listesini gönder
-                    broadcast_user_list()
+                                try:
+                                    send_json(old_conn, {"type": "error", "message": "Başka bir yerden giriş yapıldı"})
+                                    cleanup_connection(old_conn, None)
+                                except:
+                                    pass
+                            clients[username] = conn
+                        
+                        send_json(conn, {"status": "registered"})
+                        print(f"[REGISTER] ✅ {username} online oldu (toplam: {len(clients)} kullanıcı)")
+                        
+                        deliver_offline_messages(username, conn)
+                        broadcast_user_list()
+                    else:
+                        send_json(conn, {"status": "error", "message": "Kayıt başarısız"})
+                        
+                except Exception as e:
+                    print(f"[REGISTER ERROR] Resim işleme hatası: {e}")
+                    send_json(conn, {"status": "error", "message": f"Resim işleme hatası: {str(e)}"})
                     
             elif mtype == "get_users":
                 with clients_lock:
@@ -369,12 +376,10 @@ def handle_client(conn, addr):
             elif mtype == "get_history":
                 with_user = message.get("with_user")
                 if not username:
-                    print(f"[HISTORY ERROR] Kullanıcı adı belirtilmedi")
                     send_json(conn, {"type": "error", "message": "Önce giriş yapmalısınız"})
                     continue
                     
                 if not with_user:
-                    print(f"[HISTORY ERROR] Geçerli bir alıcı belirtilmedi")
                     send_json(conn, {"type": "error", "message": "Lütfen bir kullanıcı seçin"})
                     continue
                     
@@ -382,7 +387,6 @@ def handle_client(conn, addr):
                     conn_db = sqlite3.connect(DB_PATH)
                     c = conn_db.cursor()
                     
-                    # İki yönlü mesajlaşma geçmişini getir
                     query = """
                         SELECT sender, message, strftime('%Y-%m-%d %H:%M:%S', timestamp) as timestamp 
                         FROM messages 
@@ -391,12 +395,11 @@ def handle_client(conn, addr):
                     """
                     params = (username, with_user, with_user, username)
                     
-                    print(f"[HISTORY] Sorgu çalıştırılıyor: {query} {params}")
                     c.execute(query, params)
                     
                     messages = []
                     rows = c.fetchall()
-                    print(f"[HISTORY] {len(rows)} mesaj bulundu")
+                    print(f"[HISTORY] {len(rows)} mesaj bulundu: {username} <-> {with_user}")
                     
                     for row in rows:
                         messages.append({
@@ -409,8 +412,8 @@ def handle_client(conn, addr):
                     conn_db.close()
                     
                 except Exception as e:
-                    print(f"[HISTORY ERROR] Mesaj geçmişi getirilirken hata: {e}")
-                    send_json(conn, {"type": "error", "message": f"Mesaj geçmişi getirilemedi: {str(e)}"})
+                    print(f"[HISTORY ERROR] {e}")
+                    send_json(conn, {"type": "error", "message": str(e)})
 
             elif mtype == "message":
                 sender = message.get("sender", "").strip()
@@ -418,33 +421,31 @@ def handle_client(conn, addr):
                 encrypted_msg = message.get("data", "")
                 
                 if not sender or not receiver or not encrypted_msg:
-                    print(f"[MESSAGE ERROR] Eksik bilgi: sender={bool(sender)}, receiver={bool(receiver)}, data={bool(encrypted_msg)}")
+                    print(f"[MESSAGE ERROR] Eksik bilgi")
                     continue
                 
-                print(f"[MESSAGE] Mesaj alındı: {sender} -> {receiver}")
+                print(f"[MESSAGE] 📨 Mesaj alındı: {sender} -> {receiver}")
                 store_or_forward(sender, receiver, encrypted_msg)
 
             else:
                 print(f"[UNKNOWN] Bilinmeyen mesaj tipi: {mtype}")
 
-    except (ConnectionResetError, json.JSONDecodeError, OSError) as e:
-        print(f"[-] Bağlantı hatası ({addr}): {e}")
+    except socket.timeout:
+        print(f"[-] Timeout ({addr})")
+    except Exception as e:
+        print(f"[-] Hata ({addr}): {e}")
     finally:
+        cleanup_connection(conn, username)
         if username:
-            with clients_lock:
-                if clients.get(username) == conn:
-                    del clients[username]
-                    print(f"[LOGOUT] {username} offline oldu (toplam: {len(clients)} kullanıcı)")
-                    # Kullanıcı ayrıldığında diğer kullanıcıları güncelle
-                    broadcast_user_list()
-        conn.close()
+            print(f"[LOGOUT] 👋 {username} offline oldu (toplam: {len(clients)} kullanıcı)")
+            broadcast_user_list()
         print(f"[-] Bağlantı kapandı: {addr}")
 
 # --- Sunucu başlat ---
 def start_server():
     """Ana sunucu döngüsü"""
     print("=" * 60)
-    print("🔐 Güvenli Chat Sunucusu Başlatılıyor...")
+    print("🔐 Güvenli Chat Sunucusu (DES + Steganografi)")
     print("=" * 60)
     
     init_db()
@@ -471,6 +472,9 @@ def start_server():
     except Exception as e:
         print(f"[SERVER ERROR] ❌ Sunucu başlatma hatası: {e}")
     finally:
+        with clients_lock:
+            for username, conn in list(clients.items()):
+                cleanup_connection(conn, username)
         print("[SERVER] 👋 Sunucu kapatıldı")
 
 if __name__ == "__main__":
